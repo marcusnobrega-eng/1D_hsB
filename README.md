@@ -7,7 +7,8 @@ A MATLAB implementation of the 1D Hillslope-Storage Boussinesq (HSB) model for s
 ![](https://img.shields.io/github/forks/marcusnobrega-eng/DRAIN-LID)
 ![](https://img.shields.io/github/last-commit/marcusnobrega-eng/DRAIN-LID)
 
-<img width="3156" height="818" alt="Picture1" src="https://github.com/user-attachments/assets/a6f85744-3f0e-44f0-903f-c682dfd1d66c" />
+<img width="1563" height="430" alt="image" src="https://github.com/user-attachments/assets/5330e1dd-c076-46d3-a01d-f529d7a7066d" />
+
 
 ---
 
