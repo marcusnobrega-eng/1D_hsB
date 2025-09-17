@@ -1,0 +1,1110 @@
+%% Compute hsB Input Data for Complex Hillslopes
+% hsB_inputs  Compute hillslope and channel width functions from a DEM
+%
+%   [xH, H, xW, W] = hsB_inputs(demfile, acc_thresh, m, T)
+%
+% DESCRIPTION
+%   Builds the hillslope width function H(x) (distance to stream) and the
+%   channel width function W(x) (distance to outlet) for a catchment using
+%   TopoToolbox flow routing on an input DEM. This version treats all
+%   nodes as uniformly spaced — there is **no special seepage/micro cell**.
+%   Hillslope bins are equally spaced with thickness dxH = m * cellsize,
+%   and H(x) is scaled so that its integrated area exactly matches the
+%   raster hillslope area (for area closure with the DEM masks).
+%
+% METHOD (high-level)
+%   1) Load DEM, fill sinks, and build a FLOWobj (preprocess='carve').
+%   2) Build a stream network via a flow-accumulation threshold (acc_thresh).
+%   3) Compute:
+%      - D_hill: flow distance to the nearest stream (for hillslope pixels)
+%      - D_outlet: flow distance to the outlet (for channel pixels)
+%   4) Channel width function:
+%      - Histogram D_outlet over the stream mask with uniform bin size m*cellsize
+%        → Nc(x) (pixel counts per bin)
+%      - Convert to a normalized width function W(x) so that ∑ W(x)·dx = 1
+%   5) Hillslope width function (uniform nodes; no seepage cell):
+%      - Histogram raw D_hill with bin size dxH = m*cellsize
+%      - Convert pixel counts to width via (counts * cellsize^2) / dxH
+%      - Scale H so that ∑ H(x)·dxH equals the true hillslope area from the raster
+%
+% INPUTS
+%   demfile    : (char) Path to DEM file (GeoTIFF or ASCII) readable by TopoToolbox
+%   acc_thresh : (scalar, pixels) Flow accumulation threshold to define streams
+%   m          : (scalar) Bin-width multiplier; dxH = m * DEM.cellsize
+%   T          : (table) Forcing table (not used directly in width calculations,
+%                but included to keep a consistent interface with the calling code)
+%
+% OUTPUTS
+%   xH : (1×n double) Bin centers for hillslope distance to stream [m]
+%   H  : (1×n double) Hillslope width function per bin [m] (area/binwidth)
+%   xW : (1×k double) Bin centers for channel distance to outlet [m]
+%   W  : (1×k double) Channel width probability density [1/m] such that
+%        ∑ W .* dx ≈ 1 over the channel domain
+%
+% ASSUMPTIONS & UNITS
+%   - DEM horizontal units are meters; cellsize is in meters.
+%   - acc_thresh is in **pixels** (not area); stream_mask = FA > acc_thresh.
+%   - Hillslope and channel domains are mutually exclusive within the mask.
+%   - No half-cell shifts or custom first-cell treatments; all hillslope bins
+%     have identical thickness dxH.
+%
+% DIAGNOSTICS
+%   - Prints catchment, stream, and hillslope areas; checks area closure:
+%       A_cat ≈ A_stream + ∑ H·dxH
+%   - Reports the numerical integral of W(x) over its support.
+%
+% DEPENDENCIES
+%   - TopoToolbox (tested with current master/ recent releases)
+%       Required functions: GRIDobj, fillsinks, FLOWobj, flowacc, flowdistance,
+%                           STREAMobj, curvature, gradient8, aspect
+%
+% EXAMPLE
+%   demfile    = 'DEM_WBC_Conditioned_NAD83_EPSG_5070.tif';
+%   acc_thresh = 5e4;   % pixels
+%   m          = 6;     % dx = 6 * cellsize
+%   [xH, H, xW, W] = hsB_inputs(demfile, acc_thresh, m, T);
+%
+% CHANGE LOG
+%   2025-09-16  Reverted to uniform-node formulation (no seepage/micro cell).
+%               All bins equally spaced; removed half-cell shift and special
+%               first-bin handling. Area closure preserved via scaling of H.
+%
+% AUTHORSHIP
+%   Function written by **Dr. Marcus Nobrega, Ph.D.** (acknowledged author).
+%   Header and uniform-node refactor documented per the author's request.
+%
+% LICENSE
+%   Provided as-is, without warranty. Please cite TopoToolbox if used in publications.
+%
+% See also: GRIDobj, FLOWobj, flowacc, flowdistance, STREAMobj
+
+%% Directories and Inputs
+% Load DEM
+% demfile = 'C:\Users\marcu\OneDrive - University of Arizona\Documents\GitHub\hsB_Model\hSb_Model\Marcus\hsB_Functions\DEM.tif';
+demfile = 'C:\Users\marcu\OneDrive - University of Arizona\Documents\GitHub\hsB_Model\hSb_Model\Marcus\Input\DEM_WBC_Conditioned_NAD83_EPSG_5070.tif';
+
+% Forcing Data from GEE
+Forcing_path = 'G:\My Drive\WetBeaver_Forcing\Catchment_Forcing_Daily_Updated.csv';
+
+% Width Functions
+% Faccum Threshold (pixels)
+acc_thresh = 5000;
+
+% Number of cells to compute functions 
+m = 6;
+
+% Path to topotoolbox
+addpath('C:\Users\marcu\OneDrive - University of Arizona\Desktop\Desktop_Folder\HydroPol2D_Repository\Topotoolbox_Files\topotoolbox-master')
+
+% === USER INPUT ===
+focing_file = 'G:\My Drive\WetBeaver_Forcing\Catchment_Forcing_Daily_Patrick.csv';       % Change to your CSV filename
+mat_filename = 'forcing_0_Dy_WBC.mat';    % Desired .mat output file name
+
+% === Read CSV Data ===
+options = detectImportOptions(focing_file);
+options = setvartype(options, 'date', 'datetime');  % Ensure 'date' column is datetime
+
+T = readtable(focing_file, options);
+
+% --- Fix negative albedo values by carrying the last valid value forward
+albd = T.Albd;
+for i = 2:height(T)
+    if albd(i) < 0
+        albd(i) = albd(i-1);  % assign previous value
+    end
+end
+% If first value is negative (rare), set to first positive after
+if albd(1) < 0
+    first_valid = find(albd >= 0, 1, 'first');
+    if ~isempty(first_valid)
+        albd(1) = albd(first_valid);
+    else
+        error('No non-negative albedo values found in the series.');
+    end
+end
+T.Albd = albd;  % update table
+
+% --- Build & save a forcing time axis (relative days from first timestamp)
+t0_datetime      = T.date(1);                         % first timestamp
+t_forcing_days   = days(T.date - t0_datetime);        % [nF×1] double, 0-based
+
+% === Build struct array ===
+clear Forcing
+
+% Remove 'date' and make a struct array (one element per time step)
+vars = T.Properties.VariableNames;
+vars(strcmp(vars, 'date')) = [];
+T2 = T(:, vars);                     % drop date column
+Forcing = table2struct(T2, 'ToScalar', false);   % 1 element per day
+
+% Enforce column shape
+Forcing = Forcing(:)';
+
+% Sanity check
+assert(numel(Forcing) == height(T) && ~isscalar(Forcing), ...
+    'Forcing is not a struct array. Aborting save.');
+
+% Save to .mat
+save(mat_filename, 'Forcing');
+disp(['✅ Saved forcing data to ', mat_filename]);
+
+%% === Plot forcing time series nicely ===
+% labels + units for forcing plot titles ===
+labels = struct( ...
+  'Prec', struct('nice','Precipitation','unit','mm day^{-1}'), ...
+  'LRad', struct('nice','Net Longwave Radiation','unit','W m^{-2}'), ...
+  'Temp', struct('nice','Air Temperature','unit','^{\circ}C'), ...
+  'Pres', struct('nice','Surface Pressure','unit','kPa'), ...
+  'Wind', struct('nice','Wind Speed','unit','m s^{-1}'), ...
+  'VapP', struct('nice','Vapor Pressure','unit','kPa'), ...
+  'SRad', struct('nice','Net Shortwave Radiation','unit','W m^{-2}'), ...
+  'Albd', struct('nice','Albedo','unit','unitless'), ...
+  'Lai',  struct('nice','Leaf Area Index','unit','m^{2} m^{-2}') );
+
+% if your table headers already include units (e.g., 'Prec_mm_day'), map them:
+alt = containers.Map( ...
+  {'Prec_mm_day','LRad_W_m2','Temp_degC','Pres_kPa','Wind_m_s','VapP_kPa','SRad_W_m2','Albd_unitless','Lai_m2_m2'}, ...
+  {'Prec','LRad','Temp','Pres','Wind','VapP','SRad','Albd','Lai'} );
+
+
+% Assumes table T is already in memory and has a datetime column named 'date'
+
+% --- pick variables to plot (everything except 'date')
+vars = T.Properties.VariableNames;
+vars(strcmpi(vars,'date')) = [];
+
+% --- color palette (Bright) — HEX to RGB manually defined
+C = [...
+    0.000, 0.227, 0.490;  % Dark Blue  #003a7d
+    0.000, 0.553, 1.000;  % Med Blue   #008dff
+    1.000, 0.451, 0.714;  % Pink       #ff73b6
+    0.780, 0.004, 1.000;  % Purple     #c701ff
+    0.306, 0.796, 0.553;  % Green      #4ecb8d
+    1.000, 0.616, 0.227;  % Orange     #ff9d3a
+    0.976, 0.910, 0.345;  % Yellow     #f9e858
+    0.847, 0.188, 0.204]; % Red        #d83034
+
+% --- fonts
+try
+    set(groot,'defaultAxesFontName','Montserrat');
+    set(groot,'defaultTextFontName','Montserrat');
+catch
+    % Font fallback (e.g., on systems without Montserrat)
+end
+set(groot,'defaultAxesFontSize',14);
+set(groot,'defaultTextFontSize',14);
+
+% --- figure + layout
+n = numel(vars);
+ncol = 3;
+nrow = ceil(n / ncol);
+fig = figure('Position',[100 100 1600 900]);
+tl = tiledlayout(nrow, ncol, 'Padding','compact', 'TileSpacing','compact');
+title(tl,'Forcing Time Series','Interpreter','none');
+
+xmin = min(T.date);
+xmax = max(T.date);
+
+for i = 1:n
+    ax = nexttile;
+    clr = C(mod(i-1, size(C,1)) + 1, :);
+
+    % current column name in T
+    col = vars{i};
+
+    % resolve a base key (handles both simple and unitized headers)
+    if exist('alt','var') && isKey(alt, col)
+        key = alt(col);
+    else
+        key = col;
+    end
+
+    % build title text with units (fallback to raw name)
+    if isfield(labels, key)
+        ttl = sprintf('%s (%s)', labels.(key).nice, labels.(key).unit);
+        ylab = labels.(key).nice;  % keep y-label simple, or use units if you prefer
+    else
+        ttl = col; ylab = col;
+    end
+
+    % plot
+    plot(T.date, T.(col), 'LineWidth', 1.8, 'Color', clr);
+    xlim([xmin xmax]);
+
+    % styling
+    grid on; box on;
+    set(gca, 'TickDir', 'out', 'LineWidth', 2.5);
+    xtickformat('yyyy-MM');
+    xlabel('Date');
+
+    % use TeX so exponents/superscripts render (e.g., m^{-2})
+    ylabel(ylab, 'Interpreter','tex');
+    title(ttl, 'Interpreter','tex');
+
+    if i <= (nrow - 1)*ncol
+        ax.XTickLabel = []; xlabel('');
+    end
+end
+
+
+% --- export to file
+exportgraphics(fig, 'forcing_timeseries.png', 'Resolution', 300);
+
+%% === Mean-annual forcing values (mean daily * 365) ===
+% Assumes table T with columns: date, Prec, LRad, Temp, Pres, Wind, VapP, SRad, Albd, ...
+
+% pick numeric forcing variables (everything except 'date')
+vars = T.Properties.VariableNames;
+vars(strcmpi(vars,'date')) = [];
+
+% compute mean-daily for each var (omit NaNs), keep as a 1-row table
+mean_daily_tbl = varfun(@(x) mean(x,'omitnan'), T, 'InputVariables', vars);
+mean_daily_tbl.Properties.VariableNames = vars;  % remove func prefix
+
+% annualize (mean daily * 365)
+mean_annual_tbl = mean_daily_tbl;
+mean_annual_tbl{1,1} = mean_annual_tbl{1,1} * 365;
+
+% pretty print
+fprintf('\n=== Mean-Annual Forcing (mean daily × 365) ===\n');
+for i = 1:numel(vars)
+    fprintf('%-6s : %.6g\n', vars{i}, mean_annual_tbl{1,i});
+end
+
+% (optional) access specific values, e.g. mean annual precipitation [mm/yr]
+mean_annual_prec_mm = mean_annual_tbl.Prec;
+
+
+
+%% Compute Width Functions and Channel/Hillslope Parameters
+[xH, H, xW, W, metrics] = hsB_inputs(demfile, acc_thresh, m, T);
+
+function [xH, H, xW, W, metrics] = hsB_inputs(demfile, acc_thresh, m, T)
+% COMPUTE_WIDTH_FUNCTIONS_TOPOTOOLBOX
+% Computes H(x) and W(x) from a DEM using TopoToolbox.
+%
+% Inputs:
+%   - demfile    : path to input DEM file (GeoTIFF or ASCII)
+%   - acc_thresh : threshold (cells) to define stream network
+%   - m          : bin width multiplier (e.g., 2 for 2*cellsize)
+%
+% Outputs:
+%   - xH, H : Hillslope width function (distance to stream)
+%   - xW, W : Channel width function (distance to outlet)
+
+%% 1. Load and preprocess DEM
+clc; close all;
+DEM = GRIDobj(demfile);               % Load DEM
+DEM = fillsinks(DEM);                 % Fill sinks
+domain_mask = ~isnan(DEM.Z);         % Domain Mask
+area = sum(sum(domain_mask)) * DEM.cellsize^2;
+disp(['Catchment area = ', num2str(area./(10^6)), ' km2' ]);
+
+%% 2. Flow network
+FD = FLOWobj(DEM, 'preprocess', 'carve');
+FA = flowacc(FD);                     % Accumulation map
+FA.Z(~domain_mask) = nan;
+cellsize = DEM.cellsize;
+
+%% 3. Stream definition
+stream_mask = FA > acc_thresh;        % Boolean Mask
+S = STREAMobj(FD, stream_mask);       % Create stream object
+
+%% 4. Flow distance to stream (for H(x))
+hillslope_mask = ~stream_mask.Z & domain_mask;
+D_hill = flowdistance(FD, stream_mask, 'upstream');
+fd_hill = D_hill.Z(hillslope_mask);  % Hillslope pixels only
+fd_hill(isnan(fd_hill)) = [];
+
+%% 5. Flow distance to outlet (for W(x))
+D_outlet = flowdistance(FD, 'upstream');
+fd_chan = D_outlet.Z(stream_mask.Z); % Channel pixels only
+fd_chan(isnan(fd_chan)) = [];
+
+%% 6. W(x): Normalized channel width function based on pixel counts
+% Use flow distance to outlet, already computed in D_outlet
+
+fd_chan = D_outlet.Z(stream_mask.Z);     % distances of channel pixels
+fd_chan(isnan(fd_chan)) = [];            % clean NaNs
+
+% Bin the channel distances
+maxdist_channel = max(fd_chan);         % maximum distance to outlet
+edgesC = 0 : m*cellsize : ceil((maxdist_channel + cellsize*m) / m)*m;
+xW = 0.5 * (edgesC(1:end-1) + edgesC(2:end));
+Nc = histcounts(fd_chan, edgesC);        % number of pixels per bin
+figure(2)
+histogram(fd_chan, edgesC); xlabel('Distance [m]'); ylabel('Count'); title('Nc(x)')
+LT = sum(stream_mask.Z(:)) * cellsize;   % total channel length in meters
+
+
+bin_widths = diff(edgesC);               % width of each bin in meters
+W = Nc ./ (LT * m);                          % proper PDF (units: 1/m)
+
+% To verify it integrates to 1:
+integral_check = sum(W .* bin_widths);   % should be very close to 1
+disp(['Integral of W(x) = ', num2str(integral_check)]);
+
+% === Export Normalized Width Function ===
+% w_norm: structure with fields x (center distance) and W (normalized width)
+% w_norm.x = xW';   % Bin centers
+% w_norm.W = W';    % Normalized width function (PDF)
+
+w_norm = W'; % hsB assigns this way
+
+save('w_norm_WBC.mat', 'w_norm');
+
+disp('✅ Saved normalized width function to w_norm_WBC.mat');
+
+%% 7. Hillslope Width Function H(x)  [m]
+% Uniform, equally spaced nodes (no special seepage/micro cell)
+
+if isempty(fd_hill)
+    error('fd_hill is empty: no hillslope pixels found.');
+end
+
+% Uniform bin size
+dxH = m * cellsize;                        % bin thickness [m]
+
+% Use raw flow distance to stream (no half-cell shift)
+maxd   = max(fd_hill);
+% Build edges to cover the full range; ensure last bin includes maxd
+edgesH = 0 : dxH : (ceil(maxd/dxH) * dxH);
+if edgesH(end) < maxd
+    edgesH(end+1) = edgesH(end) + dxH;
+end
+
+% Bin centers (all bins have the same thickness dxH)
+xH = edgesH(1:end-1) + dxH/2;
+
+% Pixels per bin and conversion to width: width = area / binwidth
+countsH = histcounts(fd_hill, edgesH);     % pixels per bin
+H       = (countsH .* cellsize.^2) ./ dxH; % width [m]
+
+% --- Areas (true from masks) ---
+A_cat    = sum(domain_mask(:))    * cellsize^2;   % catchment [m^2]
+A_stream = sum(stream_mask.Z(:))  * cellsize^2;   % stream raster area [m^2]
+A_hs     = sum(hillslope_mask(:)) * cellsize^2;   % hillslopes [m^2]
+
+% --- Renormalize H so that integrated hillslope area equals raster hillslope area ---
+A_est = sum(H .* dxH);
+if A_est <= 0 || ~isfinite(A_est)
+    error('Hillslope width construction failed: estimated area invalid (%.3g).', A_est);
+end
+H = H * (A_hs / A_est);
+
+% --- Area closure diagnostic ---
+A_total_from_bins = sum(H .* dxH);
+gap_abs = A_cat - (A_stream + A_total_from_bins);
+gap_rel = gap_abs / max(A_cat, eps);
+fprintf(['Area check (uniform bins): A_cat=%.3f km^2, A_hs=%.3f, A_stream=%.3f, ', ...
+         'bins=%.3f, gap=%.3f (%.2f%%)\n'], ...
+        A_cat/1e6, A_hs/1e6, A_stream/1e6, A_total_from_bins/1e6, gap_abs/1e6, 100*gap_rel);
+
+% For hsB downstream use:
+% x  = xH;
+% w  = H;
+% dx = repmat(dxH, 1, numel(xH));   % all nodes equally spaced
+
+
+%% 8. Plot maps, width functions, hypsometric curve, and curvature
+figure('Position', [100 100 1800 1000]);
+
+% Convert accumulation threshold to km²
+acc_thresh_km2 = acc_thresh * DEM.cellsize^2 / 1e6;
+
+% LaTeX formatting and font
+set(groot, 'defaultAxesTickLabelInterpreter','latex'); 
+set(groot, 'defaultLegendInterpreter','latex');
+set(groot, 'defaultTextInterpreter','latex'); 
+set(groot, 'defaultAxesFontSize', 14);
+
+% Add title across all subplots
+sgtitle(sprintf('Catchment Analysis (Flow Accumulation Threshold = %.2f km$^2$)', acc_thresh_km2), ...
+        'Interpreter', 'latex', 'FontSize', 16);
+
+color1 = [0 0.4470 0.7410];     % blue
+color2 = [0.8500 0.3250 0.0980]; % orange/red
+
+% Mask outside domain
+DEMplot     = DEM.Z;        DEMplot(~domain_mask) = Inf;
+Dhillplot   = D_hill.Z;     Dhillplot(~domain_mask) = Inf;
+Doutletplot = D_outlet.Z;   Doutletplot(~domain_mask) = Inf;
+
+% Mask outside domain (set to NaN for proper background)
+DEMplot     = DEM.Z;        DEMplot(~domain_mask) = NaN;
+Dhillplot   = D_hill.Z;     Dhillplot(~domain_mask) = NaN;
+Doutletplot = D_outlet.Z;   Doutletplot(~domain_mask) = NaN;
+
+% Compute curvature
+CURV = curvature(DEM);
+curv_plot = CURV.Z;
+curv_plot(~domain_mask) = NaN;
+
+% Convenience for axes
+X = DEM.georef.SpatialRef.XWorldLimits;
+Y = DEM.georef.SpatialRef.YWorldLimits;
+
+% Subplot 1: DEM
+subplot(3,3,1)
+imagesc(X, Y, DEMplot)
+axis image
+xlabel('Easting (m)', 'Interpreter', 'latex');
+ylabel('Northing (m)', 'Interpreter', 'latex');
+title('DEM', 'Interpreter', 'latex');
+h1 = colorbar; ylabel(h1, 'Elevation (m)', 'Interpreter', 'latex');
+colormap(gca, jet)
+set(gca, 'TickDir', 'out', 'LineWidth', 1.5, 'Box', 'on');
+set(gca, 'Color', 'w') % Set background to white
+
+
+% Subplot 2: Flow distance to stream
+subplot(3,3,2)
+imagesc(X, Y, Dhillplot / 1000)
+axis image
+xlabel('Easting (m)', 'Interpreter', 'latex');
+ylabel('Northing (m)', 'Interpreter', 'latex');
+title('Flow Distance to Stream', 'Interpreter', 'latex');
+h2 = colorbar; ylabel(h2, 'Distance (km)', 'Interpreter', 'latex');
+colormap(gca, parula)
+set(gca, 'TickDir', 'out', 'LineWidth', 1.5, 'Box', 'on');
+
+% Subplot 3: Flow distance to outlet
+subplot(3,3,3)
+imagesc(X, Y, Doutletplot / 1000)
+axis image
+xlabel('Easting (m)', 'Interpreter', 'latex');
+ylabel('Northing (m)', 'Interpreter', 'latex');
+title('Flow Distance to Outlet', 'Interpreter', 'latex');
+h3 = colorbar; ylabel(h3, 'Distance (km)', 'Interpreter', 'latex');
+colormap(gca, parula)
+set(gca, 'TickDir', 'out', 'LineWidth', 1.5, 'Box', 'on');
+
+% Subplot 4: Hillslope Width Function
+subplot(3,3,4)
+plot(xH / 1000, H / 1000, '-', 'Color', color1, 'LineWidth', 2);
+xlabel('Distance to Stream (km)', 'Interpreter', 'latex');
+ylabel('$H(x)$ (km)', 'Interpreter', 'latex');
+title('Hillslope Width Function $H(x)$', 'Interpreter', 'latex');
+grid on; box on;
+set(gca, 'TickDir', 'out', 'LineWidth', 1.5)
+
+% Subplot 5: Normalized Hillslope Width
+subplot(3,3,5)
+plot(xH / 1000, H / sum(H), '--', 'Color', color1, 'LineWidth', 2);
+xlabel('Distance to Stream (km)', 'Interpreter', 'latex');
+ylabel('$\bar{H}(x)$', 'Interpreter', 'latex');
+title('Normalized Hillslope Width', 'Interpreter', 'latex');
+grid on; box on;
+set(gca, 'TickDir', 'out', 'LineWidth', 1.5)
+
+% Subplot 6: Normalized Channel Width
+subplot(3,3,6)
+plot(xW / 1000, W / sum(W), ':', 'Color', color2, 'LineWidth', 2);
+xlabel('Distance to Outlet (km)', 'Interpreter', 'latex');
+ylabel('$\bar{W}(x)$', 'Interpreter', 'latex');
+title('Normalized Channel Width', 'Interpreter', 'latex');
+grid on; box on;
+set(gca, 'TickDir', 'out', 'LineWidth', 1.5)
+
+% Subplot 7: Channel Width Function Nc(x)
+subplot(3,3,7)
+plot(xW / 1000, Nc, '-', 'Color', color2, 'LineWidth', 2);
+xlabel('Distance to Outlet (km)', 'Interpreter', 'latex');
+ylabel('$Nc(x)$', 'Interpreter', 'latex');
+title('Channel Width Function $W(x)$', 'Interpreter', 'latex');
+grid on; box on;
+set(gca, 'TickDir', 'out', 'LineWidth', 1.5)
+
+% Subplot 8: Hypsometric curve
+subplot(3,3,8)
+elevs = DEM.Z(domain_mask);
+[sorted_elevs, ~] = sort(elevs(:));
+cum_area = linspace(1, 0, numel(sorted_elevs));
+plot(cum_area, sorted_elevs, 'k', 'LineWidth', 2)
+xlabel('Relative Area (-)', 'Interpreter', 'latex');
+ylabel('Elevation (m)', 'Interpreter', 'latex');
+title('Hypsometric Curve', 'Interpreter', 'latex');
+grid on; box on;
+set(gca, 'TickDir', 'out', 'LineWidth', 1.5)
+
+% Subplot 9: Curvature map
+subplot(3,3,9)
+imagesc(X, Y, curv_plot)
+axis image
+xlabel('Easting (m)', 'Interpreter', 'latex');
+ylabel('Northing (m)', 'Interpreter', 'latex');
+title('Planform Curvature', 'Interpreter', 'latex');
+h9 = colorbar; ylabel(h9, 'Curvature (1/m)', 'Interpreter', 'latex');
+colormap(gca, jet)  % Replace with redbluecmap if you have it
+set(gca, 'TickDir', 'out', 'LineWidth', 1.5, 'Box', 'on');
+
+% Export figure
+exportgraphics(gcf, 'width_function_analysis.png', 'Resolution', 300);
+
+%% 9. Export Hillslope and Channel Width Functions to CSV with Headers
+
+% Hillslope Width Function with headers
+T_H = table(xH(:), H(:), 'VariableNames', {'Distance_to_Stream_m', 'Hillslope_Width'});
+writetable(T_H, 'Hillslope_Width_Function.csv');
+disp('Exported Hillslope Width Function to Hillslope_Width_Function.csv');
+
+% Channel Width Function with headers
+T_W = table(xW(:), W(:), 'VariableNames', {'Distance_to_Outlet_m', 'Channel_Width'});
+writetable(T_W, 'Channel_Width_Function.csv');
+disp('Exported Channel Width Function to Channel_Width_Function.csv');
+
+%% Compute Slope Map
+DEM = GRIDobj(demfile);               % Load DEM
+DEM = fillsinks(DEM);                 % Fill sinks
+
+SLOPE = gradient8(DEM, 'degree');  % Slope in degrees
+slope_map = SLOPE.Z;
+
+% Mask slope to stream
+slope_stream = slope_map(stream_mask.Z);
+slope_stream = slope_stream(~isnan(slope_stream));
+
+% Mean channel slope
+mean_slope_channel = mean(slope_stream);
+disp(['Mean channel slope = ', num2str(mean_slope_channel), ' degrees']);
+
+% Mask slope to hillslopes
+slope_hill = slope_map(hillslope_mask);
+slope_hill = slope_hill(~isnan(slope_hill));
+
+% Mean hillslope slope
+mean_slope_hillslope = mean(slope_hill);
+disp(['Mean hillslope slope = ', num2str(mean_slope_hillslope), ' degrees']);
+
+% Max Dist to Outlet
+maxdist_outlet = max(fd_chan);     % [m] maximum distance to outlet
+disp(['Max distance to outlet = ', num2str(maxdist_outlet,'%.1f'), ' m (', ...
+      num2str(maxdist_outlet/1000,'%.3f'), ' km)']);
+
+
+% Max Hillslope Length (maximum flow distance to stream) [m]
+max_hillslope_length = max(fd_hill);
+disp(['Max hillslope length = ', num2str(max_hillslope_length,'%.1f'), ' m (', ...
+      num2str(max_hillslope_length/1000,'%.3f'), ' km)']);
+
+%% Compute Aspect Map
+ASPECT = aspect(DEM);  % In degrees from North (0–360)
+aspect_map = ASPECT.Z;
+
+% === Mean Hillslope Aspect ===
+aspect_hill = aspect_map(hillslope_mask);
+aspect_hill = aspect_hill(~isnan(aspect_hill));
+
+% Convert to radians
+aspect_rad_hill = deg2rad(aspect_hill);
+
+% Vector mean of circular data
+mean_aspect_rad_hill = atan2(mean(sin(aspect_rad_hill)), mean(cos(aspect_rad_hill)));
+mean_aspect_deg_hill = mod(rad2deg(mean_aspect_rad_hill), 360);
+
+disp(['Mean hillslope aspect = ', num2str(mean_aspect_deg_hill), ' degrees from North']);
+
+% === Compute Daily Mean LAI (per DOY) with Interpolation & Smoothing ===
+dates = T.date;
+LAI = T.Lai;  % Ensure this matches your table column name
+doy = day(dates, 'dayofyear');
+
+% Step 1: Compute mean LAI for each DOY (ignoring zeros)
+LAI(LAI == 0) = NaN;  % Treat 0s as missing
+lai_doy = accumarray(doy, LAI, [366 1], @mean, NaN);
+
+% Step 2: Interpolate missing (NaN) values linearly
+x_valid = find(~isnan(lai_doy));
+y_valid = lai_doy(x_valid);
+x_all = (1:366)';
+lai_doy_interp = interp1(x_valid, y_valid, x_all, 'linear', 'extrap');
+
+% Step 3: Optional smoothing (7-day moving average)
+lai_doy = movmean(lai_doy_interp, 7);  % centered moving avg
+
+% Result: use `lai_doy_smooth(doy)` to map smoothed LAI back to full daily time series
+
+% === Export to .dat file ===
+lai_output_file = 'LAI_WBC.dat';  % Change name as needed
+writematrix(lai_doy, lai_output_file, 'Delimiter', 'tab');
+disp(['Exported daily mean LAI to ', lai_output_file]);
+
+% === Export slope and aspect ===
+slp_asp_output_file = 'hsB_SlpAsp_WBC_0.dat';
+slp_asp = [-9999, pi/180* mean_slope_hillslope, pi/180 *mean_aspect_deg_hill];  % [slope, aspect]
+writematrix(slp_asp, slp_asp_output_file, 'Delimiter', 'tab');
+disp(['Exported hillslope slope/aspect to ', slp_asp_output_file]);
+
+% === Export Width Function (x and H(x)) ===
+width_output_file = 'hsB_WidthFunc_WBC_0.dat';  % Update name if needed
+
+% Ensure x and H are column vectors of the same length
+
+% Combine into two-column matrix: [x, H(x)]
+width_table = [xH', H'];
+
+% Write to file with tab delimiter
+writematrix(width_table, width_output_file, 'Delimiter', 'tab');
+
+disp(['✅ Exported hillslope width function to ', width_output_file]);
+
+% Pack metrics into a struct (degrees + radians)
+metrics = struct( ...
+    'max_hillslope_length_m', max_hillslope_length, ...
+    'max_distance_to_outlet_m', maxdist_outlet, ...
+    'hillslope_angle_deg', mean_slope_hillslope, ...
+    'channel_angle_deg', mean_slope_channel, ...
+    'hillslope_mean_aspect_deg', mean_aspect_deg_hill, ...
+    'hillslope_angle_rad', deg2rad(mean_slope_hillslope), ...
+    'channel_angle_rad', deg2rad(mean_slope_channel), ...
+    'hillslope_mean_aspect_rad', deg2rad(mean_aspect_deg_hill) ...
+);
+
+% Optional: save a concise CSV with the key metrics
+metrics_tbl = table( ...
+    metrics.max_hillslope_length_m, ...
+    metrics.max_distance_to_outlet_m, ...
+    metrics.hillslope_angle_deg, ...
+    metrics.channel_angle_deg, ...
+    metrics.hillslope_mean_aspect_deg, ...
+    metrics.hillslope_angle_rad, ...
+    metrics.channel_angle_rad, ...
+    metrics.hillslope_mean_aspect_rad, ...
+    'VariableNames', {'MaxHsLen_m','MaxDoO_m','HsAngle_deg','ChAngle_deg', ...
+                      'HsAspect_deg','HsAngle_rad','ChAngle_rad','HsAspect_rad'});
+writetable(metrics_tbl, 'hsB_Metrics_WBC_0.csv');
+disp('✅ Exported metrics to hsB_Metrics_WBC_0.csv');
+
+% Optional: keep your existing slope/aspect .dat export (in radians)
+slp_asp_output_file = 'hsB_SlpAsp_WBC_0.dat';
+slp_asp = [-9999, metrics.hillslope_angle_rad, metrics.hillslope_mean_aspect_rad];
+writematrix(slp_asp, slp_asp_output_file, 'Delimiter', 'tab');
+disp(['Exported hillslope slope/aspect to ', slp_asp_output_file]);
+
+
+
+end
+
+
+%%% Google Earth Engine Code to Get Forcing Data %%%
+% // Set output folder name for Drive exports
+% var Folder_Name = 'WetBeaver_Forcing';
+% var crs = 'EPSG:3857';  // Web Mercator — standard for GEE visual maps
+% // Define raster scale (in meters)
+% var scale_of_image = 30;
+% var noDataVal = -9999;
+% // [⚠️ NOTE] catchment is overwritten below — assumes user has already set a variable called `catchment_shape`
+% var catchment = wet_beaver;
+% // Forcing Data
+% var startDate = ee.Date('2005-01-01');
+% var endDate   = ee.Date('2024-01-01');
+% 
+% // DEM
+% // Load MERIT DEM dataset
+% var MERIT = ee.Image("MERIT/DEM/v1_0_3")
+% // Extract the elevation band (MERIT uses 'elevation' instead of 'DEM')
+% var DEM = MERIT.select('dem');
+% // Define your catchment geometry (assumes 'catchment' is predefined)
+% var geometry = catchment;
+% // Clip the DEM to the catchment geometry
+% var image = DEM.clip(geometry);
+% // Elevation visualization settings (in meters)
+% var elevationVis = {
+%   min: 0,
+%   max: 4000,
+%   palette: [
+%     '0000ff',  // Low elevation: blue
+%     '00ff00',  // Mid: green
+%     'ffff00',  // High-mid: yellow
+%     'ff7f00',  // High: orange
+%     'ff0000'   // Very high: red
+%   ]
+% };
+% // === Display DEM ===
+% Map.addLayer(image, elevationVis, 'DEM (m)');
+% Map.centerObject(geometry, 10);
+% // Export DEM minus Bathymetry difference raster
+% Export.image.toDrive({
+%   image: image.clip(geometry),
+%   description: 'DEM',
+%   folder: Folder_Name,
+%   fileNamePrefix: 'DEM',
+%   region: geometry,
+%   scale: scale_of_image,
+%   crs: crs,
+%   formatOptions: { noData: -9999 },
+%   maxPixels: 1e10
+% });
+% 
+% // === LAND COVER (ESA WorldCover 2020) ===
+% var worldcover = ee.Image('ESA/WorldCover/v100/2020')
+%   .select('Map')
+%   .rename('LULC')
+%   .clip(geometry);
+% 
+% Map.addLayer(worldcover, {}, 'ESA Land Cover');
+% 
+% // Export LULC
+% Export.image.toDrive({
+%   image: worldcover,
+%   description: 'LULC_ESA',
+%   folder: Folder_Name,
+%   region: geometry,
+%   scale: scale_of_image,
+%   crs: crs,
+%   formatOptions: {
+%     noData: noDataVal,
+%   },
+%   maxPixels: 1e10
+% });
+% 
+% // === SOIL TEXTURE CLASS (USGS - OpenLandMap) ===
+% var soilImg = ee.Image("OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-TT_M/v02")
+%   .select('b0')
+%   .rename('Soil')
+%   .clip(geometry);
+% 
+% Map.addLayer(soilImg, {
+%   min: 1, max: 12,
+%   palette: ['d5c36b','b96947','9d3706','ae868f','f86714','46d143','368f20','3e5a14','ffd557','fff72e','ff5a9d','ff005b']
+% }, 'USGS Soil');
+% 
+% // Export Soil
+% Export.image.toDrive({
+%   image: soilImg,
+%   description: 'SOIL',
+%   folder: Folder_Name,
+%   fileNamePrefix: 'SOIL',
+%   region: geometry,
+%   scale: scale_of_image,
+%   crs: crs,
+%   formatOptions: { noData: noDataVal },
+%   maxPixels: 1e10
+% });
+% 
+% // === Compute Most Common LULC Class ===
+% var lulcDict = {
+%   10: 'Tree cover',
+%   20: 'Shrubland',
+%   30: 'Grassland',
+%   40: 'Cropland',
+%   50: 'Built-up',
+%   60: 'Bare / sparse vegetation',
+%   70: 'Snow and ice',
+%   80: 'Permanent water bodies',
+%   90: 'Herbaceous wetland',
+%   95: 'Mangroves',
+%   100: 'Moss and lichen'
+% };
+% 
+% var lulcMode = worldcover.reduceRegion({
+%   reducer: ee.Reducer.mode(),
+%   geometry: geometry,
+%   scale: scale_of_image,
+%   maxPixels: 1e10
+% }).get('LULC');
+% 
+% lulcMode.evaluate(function(code) {
+%   var rounded = Math.round(code);
+%   var label = lulcDict[rounded];
+%   if (label !== undefined) {
+%     print('🌍 Most Common LULC Class:', label, '(Code:', rounded, ')');
+%   } else {
+%     print('⚠️ Unknown LULC class code:', code);
+%   }
+% });
+% 
+% 
+% // === Compute Most Common Soil Type ===
+% var soilDict = {
+%   1: 'Clay',
+%   2: 'Silty Clay',
+%   3: 'Sandy Clay',
+%   4: 'Clay Loam',
+%   5: 'Silty Clay Loam',
+%   6: 'Sandy Clay Loam',
+%   7: 'Silty Loam',
+%   8: 'Loam',
+%   9: 'Sandy Loam',
+%   10: 'Silt',
+%   11: 'Loamy Sand',
+%   12: 'Sand'
+% };
+% 
+% var soilMode = soilImg.reduceRegion({
+%   reducer: ee.Reducer.mode(),
+%   geometry: geometry,
+%   scale: scale_of_image,
+%   maxPixels: 1e10
+% }).get('Soil');  // make sure 'Soil' matches the renamed band in soilImg
+% 
+% soilMode.evaluate(function(code) {
+%   var rounded = Math.round(code);
+%   var label = soilDict[rounded];
+%   if (label !== undefined) {
+%     print('🧱 Most Common Soil Type:', label, '(Code:', rounded, ')');
+%   } else {
+%     print('⚠️ Unknown Soil class code:', code);
+%   }
+% });
+% 
+% var bedrock_visualization = {
+%   min: 1.0,
+%   max: 50.0,
+%   palette: [
+%     'd5c36b', 'b96947', '9d3706', 'ae868f', 'f86714', '46d143',
+%     '368f20', '3e5a14', 'ffd557', 'fff72e', 'ff5a9d', 'ff005b'
+%   ]
+% };
+% 
+% // Load depth-to-bedrock image from asset
+% var DTB = ee.Image("projects/ee-marcusep2025/assets/Depth_to_bedrock")
+%   .rename('DTB')
+%   .clip(catchment);
+% 
+% // Visualization (optional - define if not already)
+% var bedrock_visualization = {
+%   min: 0,
+%   max: 10,  // Adjust as appropriate to your DTB range
+%   palette: ['white', 'blue', 'darkblue']
+% };
+% 
+% // Add to map
+% Map.addLayer(DTB, bedrock_visualization, 'DTB');
+% 
+% // Export
+% Export.image.toDrive({
+%   image: DTB,
+%   description: 'DTB',
+%   folder: Folder_Name,
+%   fileNamePrefix: 'DTB',
+%   region: geometry,
+%   scale: scale_of_image,
+%   crs: crs,
+%   formatOptions: { noData: noDataVal },
+%   maxPixels: 1e10
+% });
+% 
+% // === Compute Mean DTB over Catchment ===
+% var meanDTB = DTB.reduceRegion({
+%   reducer: ee.Reducer.mean(),
+%   geometry: geometry,
+%   scale: scale_of_image,
+%   maxPixels: 1e10
+% }).get('DTB');
+% 
+% // Convert and print to console
+% meanDTB.evaluate(function(val) {
+%   if (val !== null) {
+%     print('🪨 Average Depth to Bedrock [m]:', val.toFixed(2));
+%   } else {
+%     print('⚠️ No valid DTB data found in the catchment.');
+%   }
+% });
+% 
+% // === Summary: Dominant Soil, LULC, and Avg DTB ===
+% var summaryFeature = ee.Feature(null, {
+%   'Most_Common_Soil_Code': soilMode,
+%   'Most_Common_LULC_Code': lulcMode,
+%   'Avg_DTB_m': meanDTB
+% });
+% 
+% Export.table.toDrive({
+%   collection: ee.FeatureCollection([summaryFeature]),
+%   description: 'Summary_Soil_LULC_DTB',
+%   folder: Folder_Name,
+%   fileNamePrefix: 'Soil_LULC_DTB_Summary',
+%   fileFormat: 'CSV'
+% });
+% 
+% 
+% 
+% /***************************************************************
+%   Daily Catchment-Scale Climate Forcing Data Extraction Script
+%   -------------------------------------------------------------
+% 
+%   📍 Purpose:
+%   This script extracts and processes daily climate forcing variables
+%   over a target watershed using Google Earth Engine (GEE). It compiles 
+%   meteorological and surface biophysical parameters required for 
+%   hydrological and land-surface modeling.
+% 
+%   🗂️ Inputs:
+%   - ERA5-Land Daily Aggregated Climate Data (ECMWF/ERA5_LAND/DAILY_AGGR)
+%       * Precipitation [mm/day]
+%       * Temperature [°C]
+%       * Surface Pressure [kPa]
+%       * Wind Speed at 10m [m/s]
+%       * Dew Point Temperature [°C] → used to compute Vapor Pressure [kPa]
+%       * Net Shortwave Radiation [W/m²]
+%       * Net Longwave Radiation [W/m²]
+%       * 📅 Available: 2001-01-01 to ~2–3 days before present
+% 
+%   - MODIS Surface Datasets:
+%       * LAI (MCD15A3H) [used but not exported]
+%       * Albedo (MCD43A3) → Shortwave Broadband Albedo [unitless]
+%       * 📅 Available: 2000-02-18 to ~present (8-day or 16-day composites)
+% 
+%   - Watershed Boundary:
+%       * Derived from HydroSHEDS level 8 basins (WWF/HydroSHEDS/v1/Basins/hybas_8)
+%       * Optionally overridden by user-defined geometry (wetbeaver_pol)
+% 
+%   📤 Output:
+%   - A `.csv` file exported to Google Drive containing daily zonal-mean values
+%     for each climate variable across the catchment.
+%   - File structure:
+%       * `date`           [YYYY-MM-DD]
+%       * `Prec`           [mm/day]
+%       * `LRad`           [W/m²]     (net longwave radiation)
+%       * `Temp`           [°C]
+%       * `Pres`           [kPa]
+%       * `Wind`           [m/s]
+%       * `VapP`           [kPa]      (vapor pressure from dewpoint)
+%       * `SRad`           [W/m²]     (net shortwave radiation)
+%       * `Albd`           [unitless] (albedo 0–1)
+% 
+%   📏 Spatial Scale:
+%   - Zonal statistics computed at 9,000 meters (9 km), matching ERA5 resolution.
+% 
+%   🕒 Temporal Scale:
+%   - Adjustable by user.
+%   - Data available:
+%       * ERA5-Land: 2001-01-01 to present (daily)
+%       * MODIS LAI: 2000-02-18 to present (4-day composites)
+%       * MODIS Albedo: 2000-02-18 to present (16-day composites)
+% 
+%   👨‍💻 Developed by:
+%   Dr. Marcus Nobrega, Ph.D.
+% ***************************************************************/
+% 
+% 
+% // === SETTINGS ===
+% var region = catchment
+% 
+% 
+% // === COMPUTE DEM AREA ===
+% var demArea_km2 = region.geometry().area().divide(1e6);  // m² to km²
+% print('📏 DEM Area [km²]:', demArea_km2);
+% 
+% Map.centerObject(catchment, 8);
+% Map.addLayer(catchment, {color: 'red'}, 'Catchment');
+% 
+% // === DAILY DATE LIST ===
+% var nDays = endDate.difference(startDate, 'day');
+% var dates = ee.List.sequence(0, nDays.subtract(1)).map(function(day) {
+%   return startDate.advance(day, 'day');
+% });
+% 
+% // === DATASETS ===
+% var era5 = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+%   .filterDate(startDate, endDate)
+%   .filterBounds(region);
+% 
+% var modisLAI = ee.ImageCollection("MODIS/061/MCD15A3H")
+%   .select("Lai")
+%   .filterDate(startDate, endDate);
+% 
+% var modisAlbedo = ee.ImageCollection("MODIS/061/MCD43A3")
+%   .select("Albedo_BSA_shortwave")
+%   .filterDate(startDate, endDate);
+% 
+% // === DIAGNOSTIC CHECKS ===
+% print('🩺 Checking data availability...');
+% print('ERA5 count:', era5.size());
+% print('MODIS LAI count:', modisLAI.size());
+% print('MODIS Albedo count:', modisAlbedo.size());
+% 
+% var dailyStats = dates.map(function(date) {
+%   date = ee.Date(date);
+%   var next = date.advance(1, 'day');
+% 
+%   var eraImg = ee.Image(era5.filterDate(date, next).first());
+% 
+% 
+% 
+%   return ee.Algorithms.If(eraImg.bandNames().size().gt(0), (function() {
+% 
+%     // Safely get LAI and Albedo images or empty constant images
+%     var laiImg = ee.Image(modisLAI.filterDate(date, next).mean());
+%     laiImg = ee.Algorithms.If(
+%       laiImg.bandNames().size().gt(0),
+%       laiImg.unmask(0),
+%       ee.Image.constant(0).rename('Lai')
+%     );
+%     laiImg = ee.Image(laiImg);
+% 
+% var albedoImg = ee.Image(modisAlbedo.filterDate(date, next).mean());
+% albedoImg = ee.Algorithms.If(
+%   albedoImg.bandNames().size().gt(0),
+%   albedoImg.unmask(0),
+%   ee.Image.constant(0).rename('Albedo_BSA_shortwave')
+% );
+% albedoImg = ee.Image(albedoImg);
+% 
+% // Dew point and vapor pressure
+% var dewC = eraImg.select('dewpoint_temperature_2m').subtract(273.15).rename('dewpoint');
+% var ea = dewC.expression(
+%   '0.6108 * exp(17.27 * Td / (Td + 237.3))',
+%   {Td: dewC}
+% ).rename('ea');
+% 
+% // Combine all variables
+% var combined = ee.Image.cat([
+%   eraImg.select('total_precipitation_sum').multiply(1000).rename('Prec'), // mm/day
+%   eraImg.select('surface_net_thermal_radiation_sum')
+%     .multiply(-1)
+%     .divide(86400)
+%     .rename('LRad'), // W/m² (positive)
+%   eraImg.select('temperature_2m').subtract(273.15).rename('Temp'), // °C
+%   eraImg.select('surface_pressure').divide(1000).rename('Pres'), // kPa
+%   eraImg.select('u_component_of_wind_10m')
+%     .hypot(eraImg.select('v_component_of_wind_10m'))
+%     .rename('Wind'), // m/s
+%   ea.rename('VapP'), // vapor pressure in kPa
+%   eraImg.select('surface_net_solar_radiation_sum').divide(86400).rename('SRad'), // W/m²
+%   ee.Image(albedoImg).multiply(0.001).rename('Albd') // unitless (0–1)
+% ]);
+% 
+% 
+% 
+%     var stats = combined.reduceRegion({
+%       reducer: ee.Reducer.mean(),
+%       geometry: region,
+%       scale: 9000,
+%       maxPixels: 1e13
+%     });
+% 
+%     return ee.Feature(null, {
+%       'date': date.format('YYYY-MM-dd'),
+%       'Prec': stats.get('Prec'),
+%       'LRad': stats.get('LRad'),
+%       'Temp': stats.get('Temp'),
+%       'Pres': stats.get('Pres'),
+%       'Wind': stats.get('Wind'),
+%       'VapP': stats.get('VapP'),
+%       'SRad': stats.get('SRad'),
+%       'Albd': stats.get('Albd')
+%     }).setGeometry(null);  // ← ✅ removes .geo field
+%   })(), null);
+% });  // ← ✅ Closing the .map() function call
+% 
+% // Filter out days with missing data
+% var output = ee.FeatureCollection(dailyStats).filter(ee.Filter.notNull(['Prec']));
+% 
+% var outputSelected = ee.FeatureCollection(
+%   output.map(function(f) {
+%     return f.set('system:index', null);
+%   })
+% ).select([
+%   'date', 'Prec', 'LRad', 'Temp', 'Pres', 'Wind', 'VapP', 'SRad', 'Albd'
+% ]);
+% 
+% // === EXPORT TO GOOGLE DRIVE ===
+% Export.table.toDrive({
+%   collection: outputSelected,
+%   description: 'Daily_Climate_Forcing',
+%   folder: Folder_Name,
+%   fileNamePrefix: 'Catchment_Forcing_Daily',
+%   fileFormat: 'CSV',
+%   selectors: ['date', 'Prec', 'LRad', 'Temp', 'Pres', 'Wind', 'VapP', 'SRad', 'Albd']  // ✅ ONLY export these
+% });
